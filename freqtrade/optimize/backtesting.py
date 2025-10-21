@@ -273,7 +273,7 @@ class Backtesting:
         self.futures_data: dict[str, DataFrame] = {}
 
     def init_backtest(self):
-        self.reset_backtest(False)
+        self.prepare_backtest(False)
 
         self.wallets = Wallets(self.config, self.exchange, is_backtest=True)
 
@@ -375,6 +375,17 @@ class Backtesting:
                 candle_type=CandleType.FUNDING_RATE,
             )
 
+            open_interests_dict = history.load_data(
+                datadir=self.config["datadir"],
+                pairs=self.pairlists.whitelist,
+                timeframe=self.timeframe_detail,
+                timerange=self.timerange,
+                startup_candles=0,
+                fail_without_data=True,
+                data_format=self.config["dataformat_ohlcv"],
+                candle_type=CandleType.OPEN_INTEREST,
+            )
+
             # For simplicity, assign to CandleType.Mark (might contain index candles!)
             mark_rates_dict = history.load_data(
                 datadir=self.config["datadir"],
@@ -397,6 +408,7 @@ class Backtesting:
                 self.futures_data[pair] = self.exchange.combine_funding_and_mark(
                     funding_rates=funding_rates_dict[pair],
                     mark_rates=mark_rates_dict[pair],
+                    open_interests=open_interests_dict[pair],
                     futures_funding_rate=self.config.get("futures_funding_rate", None),
                 )
 
@@ -427,7 +439,7 @@ class Backtesting:
     def disable_database_use(self):
         disable_database_use(self.timeframe)
 
-    def reset_backtest(self, enable_protections: bool = False):
+    def prepare_backtest(self, enable_protections):
         """
         Backtesting setup method - called once for every call to "backtest()".
         """
@@ -1692,7 +1704,7 @@ class Backtesting:
         :param end_date: backtesting timerange end datetime
         :return: DataFrame with trades (results of backtesting)
         """
-        self.reset_backtest(self.enable_protections)
+        self.prepare_backtest(self.enable_protections)
         # Ensure wallets are up-to-date (important for --strategy-list)
         self.wallets.update()
         # Use dict of lists with data for performance
