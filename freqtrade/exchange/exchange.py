@@ -74,6 +74,7 @@ from freqtrade.exchange.exchange_types import (
     CcxtPosition,
     FtHas,
     FundingRate,
+    OpenInterest,
     OHLCVResponse,
     OrderBook,
     Ticker,
@@ -300,7 +301,7 @@ class Exchange:
 
         if self.trading_mode != TradingMode.SPOT and load_leverage_tiers:
             self.fill_leverage_tiers()
-        self.ft_additional_exchange_init()
+        self.additional_exchange_init()
 
     def __del__(self):
         """
@@ -454,12 +455,6 @@ class Exchange:
         Might need to be updated if https://github.com/ccxt/ccxt/issues/20408 is fixed.
         """
         return self._api.precisionMode
-
-    def ft_additional_exchange_init(self) -> None:
-        """
-        Wrapper around additional_exchange_init to simplify testing
-        """
-        self.additional_exchange_init()
 
     def additional_exchange_init(self) -> None:
         """
@@ -838,15 +833,9 @@ class Exchange:
 
     def validate_freqai(self, config: Config) -> None:
         freqai_enabled = config.get("freqai", {}).get("enabled", False)
-        override = config.get("freqai", {}).get("override_exchange_checks", False)
-        if not override and freqai_enabled and not self._ft_has["ohlcv_has_history"]:
+        if freqai_enabled and not self._ft_has["ohlcv_has_history"]:
             raise ConfigurationError(
                 f"Historic OHLCV data not available for {self.name}. Can't use freqAI."
-            )
-        elif override and freqai_enabled and not self._ft_has["ohlcv_has_history"]:
-            logger.warning(
-                "Overriding exchange checks for freqAI. Make sure that your exchange supports "
-                "fetching historic OHLCV data, otherwise freqAI will not work."
             )
 
     def validate_required_startup_candles(self, startup_candles: int, timeframe: str) -> int:
@@ -2053,6 +2042,28 @@ class Exchange:
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
 
+    @retrier
+    def fetch_open_interest(self, pair: str) -> OpenInterest:
+        """
+
+        """
+        try:
+            if pair not in self.markets or self.markets[pair].get("active", False) is False:
+                raise ExchangeError(f"Pair {pair} not available")
+            return self._api.fetch_open_interest(pair)
+        except ccxt.NotSupported as e:
+            raise OperationalException(
+                f"Exchange {self._api.name} does not support fetching open interest. Message: {e}"
+            ) from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get open interest due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
     @staticmethod
     def get_next_limit_in_list(
         limit: int,
@@ -2827,11 +2838,15 @@ class Exchange:
 
             if candle_type and candle_type not in (CandleType.SPOT, CandleType.FUTURES):
                 params.update({"price": candle_type.value})
-            if candle_type != CandleType.FUNDING_RATE:
-                data = await self._api_async.fetch_ohlcv(
-                    pair, timeframe=timeframe, since=since_ms, limit=candle_limit, params=params
-                )
-            else:
+                
+            if candle_type == CandleType.OPEN_INTEREST:
+                # Open interest             
+                data = await self._fetch_open_interest_history(
+                    pair=pair,
+                    timeframe=timeframe,
+                    since_ms=since_ms,
+                )    
+            elif candle_type == CandleType.FUNDING_RATE:
                 # Funding rate
                 data = await self._fetch_funding_rate_history(
                     pair=pair,
@@ -2839,6 +2854,11 @@ class Exchange:
                     limit=candle_limit,
                     since_ms=since_ms,
                 )
+            elif candle_type not in (CandleType.OPEN_INTEREST, CandleType.FUNDING_RATE):
+                data = await self._api_async.fetch_ohlcv(
+                    pair, timeframe=timeframe, since=since_ms, limit=candle_limit, params=params
+                )
+
             # Some exchanges sort OHLCV in ASC order and others in DESC.
             # Only sort if necessary to save computing time
             try:
@@ -2854,7 +2874,7 @@ class Exchange:
                 candle_type,
                 data,
                 # funding_rates are always complete, so never need to be dropped.
-                self._ohlcv_partial_candle if candle_type != CandleType.FUNDING_RATE else False,
+                self._ohlcv_partial_candle if candle_type not in (CandleType.FUNDING_RATE, CandleType.OPEN_INTEREST) else False
             )
 
         except ccxt.NotSupported as e:
@@ -2890,6 +2910,21 @@ class Exchange:
         data = await self._api_async.fetch_funding_rate_history(pair, since=since_ms, limit=limit)
         # Convert funding rate to candle pattern
         data = [[x["timestamp"], x["fundingRate"], 0, 0, 0, 0] for x in data]
+        return data
+
+    async def _fetch_open_interest_history(
+        self,
+        pair: str,
+        timeframe: str,
+        since_ms: int | None = None,
+    ) -> list[list]:
+        """
+
+        """
+        # open interest
+        data = await self._api_async.fetch_open_interest_history(pair, since=since_ms)
+        # Convert funding rate to candle pattern
+        data = [[x["timestamp"], x["openInterestAmount"], 0, 0, 0, x["openInterestValue"]] for x in data]
         return data
 
     # fetch Trade data stuff
@@ -3685,9 +3720,10 @@ class Exchange:
 
         mark_comb: PairWithTimeframe = (pair, timeframe, mark_price_type)
         funding_comb: PairWithTimeframe = (pair, timeframe_ff, CandleType.FUNDING_RATE)
+        interest_comb: PairWithTimeframe = (pair, timeframe_ff, CandleType.OPEN_INTEREST)
 
         candle_histories = self.refresh_latest_ohlcv(
-            [mark_comb, funding_comb],
+            [mark_comb, funding_comb, interest_comb],
             since_ms=since_ms,
             cache=False,
             drop_incomplete=False,
@@ -3696,10 +3732,11 @@ class Exchange:
             # we can't assume we always get histories - for example during exchange downtimes
             funding_rates = candle_histories[funding_comb]
             mark_rates = candle_histories[mark_comb]
+            open_interests = candle_histories[interest_comb]
         except KeyError:
             raise ExchangeError("Could not find funding rates.") from None
 
-        funding_mark_rates = self.combine_funding_and_mark(funding_rates, mark_rates)
+        funding_mark_rates = self.combine_funding_and_mark(funding_rates, mark_rates, open_interests)
 
         return self.calculate_funding_fees(
             funding_mark_rates,
@@ -3711,7 +3748,7 @@ class Exchange:
 
     @staticmethod
     def combine_funding_and_mark(
-        funding_rates: DataFrame, mark_rates: DataFrame, futures_funding_rate: int | None = None
+        funding_rates: DataFrame, mark_rates: DataFrame, open_interests: DataFrame, futures_funding_rate: int | None = None
     ) -> DataFrame:
         """
         Combine funding-rates and mark-rates dataframes
