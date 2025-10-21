@@ -12,6 +12,7 @@ class CandleType(str, Enum):
 
     # TODO: Could take up less memory if these weren't a CandleType
     FUNDING_RATE = "funding_rate"
+    OPEN_INTEREST = "open_interest"
     # BORROW_RATE = "borrow_rate"  # * unimplemented
 
     def __str__(self):
