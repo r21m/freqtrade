@@ -57,7 +57,7 @@ def informative(
     * {column} - name of dataframe column.
     * {timeframe} - timeframe of informative dataframe.
     :param ffill: ffill dataframe after merging informative pair.
-    :param candle_type: '', mark, index, premiumIndex, or funding_rate
+    :param candle_type: '', mark, index, premiumIndex, open_interest or funding_rate
     """
     _asset = asset
     _timeframe = timeframe
